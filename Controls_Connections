@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""
+Flask app: live video feed + two-motor control via L298N #1
+Run:   python3 app.py
+Open:  http://192.168.2.1:5000
+"""
+
+from flask import Flask, Response, render_template_string, jsonify, request
+from picamera2 import Picamera2
+import RPi.GPIO as GPIO
+import threading, io, time
+
+# Pin definitions (L298N #1)
+ENB = 25   # Left  motor speed (PWM)
+IN3 = 23   # Left  motor dir
+IN4 = 24   # Left  motor dir
+ENA = 17   # Right motor speed (PWM)
+IN1 = 27   # Right motor dir
+IN2 = 22   # Right motor dir
+
+PWM_FREQ   = 1000          # Hz
+SPEED_LEVELS = 10          # number of speed steps
+speed_level  = 5           # current level (1–10), 0 = stopped
+
+# GPIO / PWM setup 
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+for pin in (ENA, IN1, IN2, IN3, IN4, ENB):
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, GPIO.LOW)
+
+pwm_a = GPIO.PWM(ENA, PWM_FREQ)
+pwm_b = GPIO.PWM(ENB, PWM_FREQ)
+pwm_a.start(0)
+pwm_b.start(0)
+
+#  Camera 
+cam = Picamera2()
+cam.configure(cam.create_video_configuration(main={"size": (640, 480)}))
+cam.start()
+
+app = Flask(__name__)
+
+#  Motor helpers
+def duty(level):
+    """Convert speed level (0–10) to PWM duty cycle (0–100)."""
+    return (level / SPEED_LEVELS) * 100
+
+def set_left(level, fwd=True):
+    # NOTE: fwd=True here physically moves the robot forward
+    # Direction pins are INVERTED from what you'd expect — left motor is mounted mirrored
+    GPIO.output(IN3, GPIO.LOW  if fwd else GPIO.HIGH)
+    GPIO.output(IN4, GPIO.HIGH if fwd else GPIO.LOW)
+    pwm_b.ChangeDutyCycle(duty(level))
+
+def set_right(level, fwd=True):
+    # Direction pins are INVERTED — right motor is mounted mirrored
+    GPIO.output(IN1, GPIO.LOW  if fwd else GPIO.HIGH)
+    GPIO.output(IN2, GPIO.HIGH if fwd else GPIO.LOW)
+    pwm_a.ChangeDutyCycle(duty(level))
+
+def stop():
+    for pin in (IN1, IN2, IN3, IN4):
+        GPIO.output(pin, GPIO.LOW)
+    pwm_a.ChangeDutyCycle(0)
+    pwm_b.ChangeDutyCycle(0)
+
+# Command map 
+def cmd_forward():  set_left(speed_level);              set_right(speed_level)
+def cmd_backward(): set_left(speed_level,  fwd=False);  set_right(speed_level, fwd=False)
+def cmd_left():     set_left(speed_level,  fwd=False);  set_right(speed_level)
+def cmd_right():    set_left(speed_level);              set_right(speed_level, fwd=False)
+def cmd_stop():     stop()
+
+COMMANDS = {
+    "forward":  cmd_forward,
+    "backward": cmd_backward,
+    "left":     cmd_left,
+    "right":    cmd_right,
+    "stop":     cmd_stop,
+}
+
+#  Video stream 
+def gen_frames():
+    while True:
+        buf = io.BytesIO()
+        cam.capture_file(buf, format="jpeg")
+        buf.seek(0)
+        frame = buf.read()
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+
+#  HTML UI 
+HTML = """<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Robot Control</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #111; color: #eee; font-family: sans-serif;
+           display: flex; flex-direction: column; align-items: center;
+           padding: 12px; gap: 10px; }
+    #feed { width: 100%; max-width: 640px; border-radius: 8px; background: #000; display: block; }
+    #status { font-size: 12px; color: #888; }
+
+    /* Speed bar */
+    #speed-bar { display: flex; align-items: center; gap: 10px; width: 100%; max-width: 400px; }
+    #speed-bar span { font-size: 13px; min-width: 90px; }
+    #speed-track { flex: 1; height: 10px; background: #333; border-radius: 5px; overflow: hidden; }
+    #speed-fill  { height: 100%; background: #0af; width: 50%; transition: width .15s; border-radius: 5px; }
+    #speed-btns  { display: flex; gap: 6px; }
+    #speed-btns button { width: 36px; height: 36px; font-size: 18px; border: none;
+                         border-radius: 6px; background: #333; color: #eee; cursor: pointer; }
+    #speed-btns button:active { background: #0af; color: #000; }
+
+    /* D-pad */
+    #dpad { display: grid; grid-template-columns: repeat(3, 72px);
+            grid-template-rows: repeat(3, 72px); gap: 6px; }
+    .btn { display: flex; align-items: center; justify-content: center;
+           font-size: 26px; border-radius: 10px; border: none;
+           background: #222; color: #eee; cursor: pointer; user-select: none;
+           touch-action: none; -webkit-tap-highlight-color: transparent; }
+    .btn:active, .btn.pressed { background: #0af; color: #000; }
+    #btn-stop { background: #500; font-size: 14px; }
+    #btn-stop.pressed, #btn-stop:active { background: #f00; }
+  </style>
+</head>
+<body>
+  <img id="feed" src="/video_feed">
+  <div id="status">Connecting…</div>
+
+  <div id="speed-bar">
+    <span id="speed-label">Speed: 5 / 10</span>
+    <div id="speed-track"><div id="speed-fill"></div></div>
+    <div id="speed-btns">
+      <button id="btn-minus">−</button>
+      <button id="btn-plus">+</button>
+    </div>
+  </div>
+
+  <div id="dpad">
+    <div></div>
+    <button class="btn" id="btn-forward"  data-cmd="forward">▲</button>
+    <div></div>
+    <button class="btn" id="btn-left"     data-cmd="left">◀</button>
+    <button class="btn" id="btn-stop"     data-cmd="stop">■ STOP</button>
+    <button class="btn" id="btn-right"    data-cmd="right">▶</button>
+    <div></div>
+    <button class="btn" id="btn-backward" data-cmd="backward">▼</button>
+    <div></div>
+  </div>
+
+  <script>
+    let currentCmd  = null;
+    let repeatTimer = null;
+    let speedLevel  = 5;
+    const MAX_SPEED = 10;
+
+    // Speed UI 
+    function updateSpeedUI() {
+      document.getElementById('speed-label').textContent = `Speed: ${speedLevel} / ${MAX_SPEED}`;
+      document.getElementById('speed-fill').style.width  = (speedLevel / MAX_SPEED * 100) + '%';
+    }
+
+    function setSpeed(lvl) {
+      speedLevel = Math.max(0, Math.min(MAX_SPEED, lvl));
+      updateSpeedUI();
+      fetch('/speed/' + speedLevel, { method: 'POST' });
+      // If currently moving, re-send the command at the new speed
+      if (currentCmd && currentCmd !== 'stop') sendCmd(currentCmd);
+    }
+
+    document.getElementById('btn-plus').addEventListener('click',  () => setSpeed(speedLevel + 1));
+    document.getElementById('btn-minus').addEventListener('click', () => setSpeed(speedLevel - 1));
+
+    //  Motion commands 
+    function sendCmd(cmd) {
+      fetch('/cmd/' + cmd, { method: 'POST' }).catch(() => {});
+    }
+
+    function startCmd(cmd) {
+      if (currentCmd === cmd) return;
+      currentCmd = cmd;
+      sendCmd(cmd);
+      clearInterval(repeatTimer);
+      if (cmd !== 'stop') repeatTimer = setInterval(() => sendCmd(cmd), 400);
+    }
+
+    function releaseCmd(cmd) {
+      if (currentCmd !== cmd) return;
+      clearInterval(repeatTimer);
+      currentCmd = null;
+      sendCmd('stop');
+    }
+
+    // D-pad buttons
+    document.querySelectorAll('.btn[data-cmd]').forEach(btn => {
+      const cmd = btn.dataset.cmd;
+      ['mousedown','touchstart'].forEach(ev =>
+        btn.addEventListener(ev, e => { e.preventDefault(); btn.classList.add('pressed'); startCmd(cmd); }, { passive: false })
+      );
+      ['mouseup','mouseleave','touchend','touchcancel'].forEach(ev =>
+        btn.addEventListener(ev, e => { btn.classList.remove('pressed'); if (cmd !== 'stop') releaseCmd(cmd); }, { passive: false })
+      );
+    });
+
+    //  Keyboard 
+    const keyMap = {
+      ArrowUp: 'forward', w: 'forward',
+      ArrowDown: 'backward', s: 'backward',
+      ArrowLeft: 'left',  a: 'left',
+      ArrowRight: 'right', d: 'right',
+      ' ': 'stop'
+    };
+    const held = new Set();
+
+    document.addEventListener('keydown', e => {
+      // Speed: + / - keys
+      if (e.key === '+' || e.key === '=') { e.preventDefault(); setSpeed(speedLevel + 1); return; }
+      if (e.key === '-' || e.key === '_') { e.preventDefault(); setSpeed(speedLevel - 1); return; }
+
+      // Speed: number keys 0–9
+      if (/^[0-9]$/.test(e.key)) {
+        e.preventDefault();
+        const n = parseInt(e.key);
+        // 0 = stop (level 0), 1 = slowest (level 1), 9 = fastest (level 9 → mapped to 10)
+        const lvl = n === 0 ? 0 : n;
+        setSpeed(lvl);
+        if (lvl === 0) { startCmd('stop'); }
+        return;
+      }
+
+      const cmd = keyMap[e.key];
+      if (!cmd || held.has(e.key)) return;
+      held.add(e.key);
+      e.preventDefault();
+      document.querySelector(`[data-cmd="${cmd}"]`)?.classList.add('pressed');
+      startCmd(cmd);
+    });
+
+    document.addEventListener('keyup', e => {
+      const cmd = keyMap[e.key];
+      if (!cmd) return;
+      held.delete(e.key);
+      document.querySelector(`[data-cmd="${cmd}"]`)?.classList.remove('pressed');
+      if (cmd !== 'stop') releaseCmd(cmd);
+    });
+
+    document.getElementById('feed').onload = () =>
+      document.getElementById('status').textContent = 'Feed active';
+
+    updateSpeedUI();
+  </script>
+</body>
+</html>"""
+
+#  Routes 
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(gen_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.route("/cmd/<command>", methods=["POST"])
+def command(command):
+    fn = COMMANDS.get(command)
+    if fn:
+        fn()
+        return jsonify({"status": "ok", "cmd": command})
+    return jsonify({"status": "unknown command"}), 400
+
+@app.route("/speed/<int:level>", methods=["POST"])
+def set_speed_route(level):
+    global speed_level
+    speed_level = max(0, min(SPEED_LEVELS, level))
+    return jsonify({"status": "ok", "speed": speed_level})
+
+if __name__ == "__main__":
+    try:
+        app.run(host="0.0.0.0", port=5000, threaded=True)
+    finally:
+        stop()
+        GPIO.cleanup()
